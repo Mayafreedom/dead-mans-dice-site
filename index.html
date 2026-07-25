@@ -6,17 +6,39 @@
 <title>Dead Man's Dice</title>
 
 <!-- React + ReactDOM (UMD builds, no build step needed) -->
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
 
 <!-- Babel: lets the browser understand JSX directly, no build step -->
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
 
 <!-- Tailwind's play CDN: same utility classes we used, no build step -->
 <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body>
 <div id="root"></div>
+<div id="diag" style="font-family: monospace; white-space: pre-wrap; color: #ff6b6b; background: #111; padding: 16px; display: none;"></div>
+<script>
+  function showDiag(msg) {
+    var el = document.getElementById("diag");
+    el.style.display = "block";
+    el.textContent += msg + "\n\n";
+  }
+  window.addEventListener("error", function (e) {
+    showDiag("JS ERROR: " + e.message + "\n  at " + e.filename + ":" + e.lineno);
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    showDiag("UNHANDLED PROMISE REJECTION: " + (e.reason && e.reason.message ? e.reason.message : e.reason));
+  });
+  setTimeout(function () {
+    if (typeof React === "undefined") showDiag("React never loaded (CDN script for React failed).");
+    if (typeof ReactDOM === "undefined") showDiag("ReactDOM never loaded (CDN script failed).");
+    if (typeof Babel === "undefined") showDiag("Babel never loaded (CDN script failed).");
+    if (document.getElementById("root").children.length === 0 && document.getElementById("diag").textContent === "") {
+      showDiag("Nothing rendered into #root, and no JS error was caught. This usually means the type=text/babel script did not run.");
+    }
+  }, 4000);
+</script>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useCallback } = React;
 // Plain emoji stand-ins instead of lucide-react, so this file needs no npm
@@ -1047,3 +1069,4 @@ ReactDOM.createRoot(document.getElementById("root")).render(<DeadMansDice />);
 </script>
 </body>
 </html>
+
