@@ -1,0 +1,1049 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Dead Man's Dice</title>
+
+<!-- React + ReactDOM (UMD builds, no build step needed) -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+<!-- Babel: lets the browser understand JSX directly, no build step -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Tailwind's play CDN: same utility classes we used, no build step -->
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+// Plain emoji stand-ins instead of lucide-react, so this file needs no npm
+// install at all -- just React and Babel loaded from a CDN in index.html.
+const iconStyle = (size) => ({ fontSize: size, lineHeight: 1, display: "inline-block" });
+const Skull = ({ size = 16 }) => <span style={iconStyle(size)}>💀</span>;
+const Crosshair = ({ size = 16 }) => <span style={iconStyle(size)}>🔫</span>;
+const Target = ({ size = 16 }) => <span style={iconStyle(size)}>🎯</span>;
+const Plus = ({ size = 16 }) => <span style={iconStyle(size)}>+</span>;
+const Minus = ({ size = 16 }) => <span style={iconStyle(size)}>−</span>;
+const RotateCcw = ({ size = 16 }) => <span style={iconStyle(size)}>↺</span>;
+const Coins = ({ size = 16 }) => <span style={iconStyle(size)}>🪙</span>;
+const Play = ({ size = 16 }) => <span style={iconStyle(size)}>▶</span>;
+const CalendarCheck = ({ size = 16 }) => <span style={iconStyle(size)}>📅</span>;
+const LogOut = ({ size = 16 }) => <span style={iconStyle(size)}>🚪</span>;
+const Volume2 = ({ size = 16 }) => <span style={iconStyle(size)}>🔊</span>;
+const VolumeX = ({ size = 16 }) => <span style={iconStyle(size)}>🔇</span>;
+const Hand = ({ size = 16 }) => <span style={iconStyle(size)}>✋</span>;
+
+// =====================================================================
+// Point this at your deployed backend (see the dmd-backend README for
+// how to get it running on Render). Everything in this file now talks
+// to that API instead of holding game state locally.
+// =====================================================================
+const API_BASE = "https://dead-mans-dice-backend.onrender.com";
+
+const FACES = [1, 2, 3, 4, 5, 6];
+const CHECKIN_REWARDS = [50, 75, 100, 125, 150, 200, 500];
+const TABLES = [
+  { label: "Low Stakes", amount: 20 },
+  { label: "Mid Stakes", amount: 50 },
+  { label: "High Stakes", amount: 100 },
+];
+
+// Small client-side copies of the bid rules, used only to drive the UI
+// (default selection, enabling/disabling the Place Bid button). The
+// server re-validates everything -- this is convenience, not authority.
+function isValidBid(newBid, currentBid) {
+  if (!currentBid) return newBid.qty >= 1;
+  return newBid.qty > currentBid.qty || (newBid.qty === currentBid.qty && newBid.face > currentBid.face);
+}
+function minimalNextBid(currentBid) {
+  if (!currentBid) return { qty: 1, face: 1 };
+  const { qty, face } = currentBid;
+  if (face === 6) return { qty: qty + 1, face: 1 };
+  return { qty, face: face + 1 };
+}
+
+async function apiRequest(path, { method = "GET", body, token } = {}) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = {};
+  try {
+    data = await res.json();
+  } catch (e) {
+    // no body
+  }
+  if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+  return data;
+}
+
+// =====================================================================
+// Sound effects, synthesized on the fly with the Web Audio API. No audio
+// files to fetch or license -- everything below is generated noise/tones.
+// Browsers block audio until a user gesture, so the AudioContext is only
+// created lazily, inside a click handler.
+// =====================================================================
+let sharedAudioCtx = null;
+function getAudioCtx() {
+  if (!sharedAudioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    sharedAudioCtx = new Ctx();
+  }
+  if (sharedAudioCtx.state === "suspended") sharedAudioCtx.resume();
+  return sharedAudioCtx;
+}
+
+function noiseBuffer(ctx, durationSec) {
+  const buffer = ctx.createBuffer(1, ctx.sampleRate * durationSec, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  return buffer;
+}
+
+function playThud(ctx, { freq = 90, decay = 0.18, volume = 0.5 } = {}) {
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.setValueAtTime(freq, ctx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(20, freq * 0.4), ctx.currentTime + decay);
+  gain.gain.setValueAtTime(volume, ctx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + decay);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start();
+  osc.stop(ctx.currentTime + decay);
+}
+
+function playWoodKnock(ctx, volume = 0.35) {
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(ctx, 0.08);
+  const filter = ctx.createBiquadFilter();
+  filter.type = "bandpass";
+  filter.frequency.value = 1200;
+  filter.Q.value = 1.2;
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(volume, ctx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.09);
+  src.connect(filter).connect(gain).connect(ctx.destination);
+  src.start();
+  playThud(ctx, { freq: 130, decay: 0.12, volume: volume * 0.8 });
+}
+
+function playDiceRattle(ctx, hits = 8, volume = 0.22) {
+  for (let i = 0; i < hits; i++) {
+    const t = i * (0.045 + Math.random() * 0.03);
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuffer(ctx, 0.04);
+    const filter = ctx.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.value = 2200 + Math.random() * 1800;
+    filter.Q.value = 2;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(volume * (0.6 + Math.random() * 0.4), ctx.currentTime + t);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t + 0.05);
+    src.connect(filter).connect(gain).connect(ctx.destination);
+    src.start(ctx.currentTime + t);
+  }
+}
+
+function playTone(ctx, freq, startOffset, durationSec, volume = 0.2, type = "sine") {
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.0001, ctx.currentTime + startOffset);
+  gain.gain.exponentialRampToValueAtTime(volume, ctx.currentTime + startOffset + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + startOffset + durationSec);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(ctx.currentTime + startOffset);
+  osc.stop(ctx.currentTime + startOffset + durationSec + 0.02);
+}
+
+const sounds = {
+  cupLift(enabled) {
+    if (!enabled) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    playWoodKnock(ctx, 0.3);
+    setTimeout(() => playDiceRattle(ctx, 6, 0.15), 60);
+  },
+  bidSlam(enabled) {
+    if (!enabled) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    playWoodKnock(ctx, 0.4);
+  },
+  challengeSting(enabled) {
+    if (!enabled) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    playTone(ctx, 180, 0, 0.16, 0.3, "sawtooth");
+    playTone(ctx, 140, 0.12, 0.2, 0.28, "sawtooth");
+  },
+  spotOnSting(enabled) {
+    if (!enabled) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    playTone(ctx, 520, 0, 0.12, 0.22, "triangle");
+    playTone(ctx, 660, 0.08, 0.14, 0.22, "triangle");
+  },
+  reveal(enabled) {
+    if (!enabled) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    playDiceRattle(ctx, 10, 0.2);
+    setTimeout(() => playThud(ctx, { freq: 100, decay: 0.2, volume: 0.35 }), 260);
+  },
+  win(enabled) {
+    if (!enabled) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    [523, 659, 784, 1046].forEach((f, i) => playTone(ctx, f, i * 0.11, 0.22, 0.24, "triangle"));
+  },
+  lose(enabled) {
+    if (!enabled) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    playTone(ctx, 200, 0, 0.3, 0.22, "sine");
+    playTone(ctx, 140, 0.18, 0.35, 0.22, "sine");
+  },
+  coin(enabled) {
+    if (!enabled) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    playTone(ctx, 880, 0, 0.09, 0.2, "square");
+    playTone(ctx, 1180, 0.06, 0.12, 0.18, "square");
+  },
+};
+
+function DiceFace({ value, hidden, highlight, size = 40 }) {
+  if (hidden) {
+    return (
+      <div
+        style={{ width: size, height: size }}
+        className="rounded-md bg-gradient-to-br from-[#5a3a22] to-[#2c1a0e] border-2 border-[#7a5030] shadow-inner"
+      />
+    );
+  }
+  const pipPositions = {
+    1: [[50, 50]],
+    2: [[25, 25], [75, 75]],
+    3: [[25, 25], [50, 50], [75, 75]],
+    4: [[25, 25], [75, 25], [25, 75], [75, 75]],
+    5: [[25, 25], [75, 25], [50, 50], [25, 75], [75, 75]],
+    6: [[25, 25], [75, 25], [25, 50], [75, 50], [25, 75], [75, 75]],
+  };
+  return (
+    <div
+      style={{ width: size, height: size }}
+      className={`relative rounded-md border-2 shadow-md ${
+        highlight
+          ? "bg-gradient-to-br from-[#c9a227] to-[#8a6b1f] border-[#e8d9b5]"
+          : "bg-gradient-to-br from-[#ecdcb0] to-[#d8c290] border-[#8a6b2f]"
+      }`}
+    >
+      {pipPositions[value].map(([x, y], i) => (
+        <div
+          key={i}
+          className="absolute rounded-full"
+          style={{
+            left: `${x}%`,
+            top: `${y}%`,
+            width: size * 0.16,
+            height: size * 0.16,
+            transform: "translate(-50%, -50%)",
+            background: highlight ? "#3a2a08" : "#241812",
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+// =====================================================================
+// Stylized flat-vector portraits for the table. Original character
+// designs (not photos/likenesses), drawn as inline SVG so there's
+// nothing to fetch or license. Each has a couple of "reaction" states
+// swapped in at showdown, using only information that's already public
+// at that moment (who called, who got caught).
+// =====================================================================
+function Eyes({ reaction, cx1 = 26, cx2 = 38, cy = 30 }) {
+  if (reaction === "caught") {
+    return (
+      <>
+        <circle cx={cx1} cy={cy} r="4.2" fill="#241812" />
+        <circle cx={cx2} cy={cy} r="4.2" fill="#241812" />
+        <circle cx={cx1} cy={cy - 1.2} r="1.3" fill="#fff" />
+        <circle cx={cx2} cy={cy - 1.2} r="1.3" fill="#fff" />
+      </>
+    );
+  }
+  if (reaction === "smug") {
+    return (
+      <>
+        <path d={`M ${cx1 - 4} ${cy} q 4 -3 8 0`} stroke="#241812" strokeWidth="2.2" fill="none" strokeLinecap="round" />
+        <path d={`M ${cx2 - 4} ${cy} q 4 -3 8 0`} stroke="#241812" strokeWidth="2.2" fill="none" strokeLinecap="round" />
+      </>
+    );
+  }
+  return (
+    <>
+      <ellipse cx={cx1} cy={cy} rx="2.6" ry="2" fill="#241812" />
+      <ellipse cx={cx2} cy={cy} rx="2.6" ry="2" fill="#241812" />
+    </>
+  );
+}
+
+function Mouth({ reaction, cy = 42 }) {
+  if (reaction === "caught") return <ellipse cx="32" cy={cy + 1} rx="3.4" ry="4.2" fill="#5a2323" />;
+  if (reaction === "smug") return <path d={`M 25 ${cy} Q 32 ${cy + 5} 39 ${cy}`} stroke="#241812" strokeWidth="2.2" fill="none" strokeLinecap="round" />;
+  return <path d={`M 26 ${cy} Q 32 ${cy + 2} 38 ${cy}`} stroke="#241812" strokeWidth="2" fill="none" strokeLinecap="round" />;
+}
+
+function RosaPortrait({ size = 56, reaction = "neutral" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 64 64">
+      <circle cx="32" cy="34" r="18" fill="#d9a679" />
+      <path d="M14 30 Q16 10 32 10 Q48 10 50 30 Q40 20 32 20 Q24 20 14 30 Z" fill="#2a1a12" />
+      <path d="M18 24 Q32 30 46 24 L46 30 Q32 36 18 30 Z" fill="#9c3b3b" />
+      <circle cx="46" cy="27" r="2" fill="#e8d9b5" />
+      <Eyes reaction={reaction} />
+      <path d="M22 27 Q26 24 30 27" stroke="#2a1a12" strokeWidth="1.6" fill="none" strokeLinecap="round" />
+      <path d="M34 27 Q38 24 42 27" stroke="#2a1a12" strokeWidth="1.6" fill="none" strokeLinecap="round" />
+      <Mouth reaction={reaction} />
+    </svg>
+  );
+}
+
+function DocPortrait({ size = 56, reaction = "neutral" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 64 64">
+      <circle cx="32" cy="34" r="18" fill="#e0b98f" />
+      <path d="M12 26 Q14 8 32 8 Q50 8 52 26 L52 20 Q32 12 12 20 Z" fill="#241812" />
+      <rect x="10" y="16" width="44" height="6" rx="2" fill="#241812" />
+      <circle cx="24" cy="31" r="7" fill="none" stroke="#241812" strokeWidth="2" />
+      <circle cx="40" cy="31" r="7" fill="none" stroke="#241812" strokeWidth="2" />
+      <line x1="31" y1="31" x2="33" y2="31" stroke="#241812" strokeWidth="2" />
+      <Eyes reaction={reaction} cx1={24} cx2={40} cy={31} />
+      <path d="M24 40 Q32 43 40 40 Q32 44 24 40 Z" fill="#4a3524" />
+      <Mouth reaction={reaction} cy={44} />
+      <path d="M16 46 Q32 40 48 46 L48 56 L16 56 Z" fill="#3b6b6f" />
+    </svg>
+  );
+}
+
+function SamPortrait({ size = 56, reaction = "neutral" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 64 64">
+      <ellipse cx="32" cy="36" rx="19" ry="18" fill="#dba876" />
+      <path d="M8 26 Q10 12 32 12 Q54 12 56 26 Q54 20 32 20 Q10 20 8 26 Z" fill="#5a3a22" />
+      <path d="M4 27 Q32 14 60 27 Q56 22 32 22 Q8 22 4 27 Z" fill="#4a2e1a" />
+      <Eyes reaction={reaction} cy={32} />
+      <path d="M18 26 Q23 22 28 26" stroke="#2a1a12" strokeWidth="2" fill="none" strokeLinecap="round" />
+      <path d="M36 26 Q41 22 46 26" stroke="#2a1a12" strokeWidth="2" fill="none" strokeLinecap="round" />
+      <path d="M18 44 Q32 54 46 44 Q46 52 32 56 Q18 52 18 44 Z" fill="#6b5430" />
+      <Mouth reaction={reaction} cy={41} />
+    </svg>
+  );
+}
+
+function StrangerPortrait({ size = 40 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 64 64">
+      <circle cx="32" cy="36" r="17" fill="#c9a877" />
+      <path d="M10 28 Q12 10 32 10 Q52 10 54 28 Q46 18 32 18 Q18 18 10 28 Z" fill="#3b2415" />
+      <path d="M6 30 Q32 16 58 30 Q52 24 32 24 Q12 24 6 30 Z" fill="#241812" />
+      <ellipse cx="25" cy="34" rx="2.4" ry="2" fill="#241812" />
+      <ellipse cx="39" cy="34" rx="2.4" ry="2" fill="#241812" />
+      <path d="M26 44 Q32 46 38 44" stroke="#241812" strokeWidth="2" fill="none" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function NpcPortrait({ id, size, reaction }) {
+  if (id === "rosa") return <RosaPortrait size={size} reaction={reaction} />;
+  if (id === "doc") return <DocPortrait size={size} reaction={reaction} />;
+  if (id === "sam") return <SamPortrait size={size} reaction={reaction} />;
+  return null;
+}
+
+// The big interactive cup covering the player's own dice until lifted.
+function LiftCup({ onLift }) {
+  const [lifting, setLifting] = useState(false);
+  const handleClick = () => {
+    if (lifting) return;
+    setLifting(true);
+    setTimeout(() => onLift(), 380);
+  };
+  return (
+    <button
+      onClick={handleClick}
+      className="relative w-full flex flex-col items-center justify-center py-3 group"
+      style={{ minHeight: 64 }}
+    >
+      <div
+        className="transition-all duration-300 ease-out"
+        style={{
+          width: 84,
+          height: 46,
+          background: "linear-gradient(180deg, #6b4526, #3a2410)",
+          borderRadius: "6px 6px 26px 26px / 6px 6px 30px 30px",
+          border: "2px solid #8a6b2f",
+          boxShadow: "0 3px 6px rgba(0,0,0,0.5)",
+          transform: lifting ? "translateY(-26px) rotate(-14deg)" : "translateY(0) rotate(0deg)",
+          opacity: lifting ? 0 : 1,
+        }}
+      />
+      <div
+        className="text-[#d98f3b] text-[10px] uppercase tracking-widest mt-1 rye group-hover:text-[#e8a555]"
+        style={{ opacity: lifting ? 0 : 1, transition: "opacity 0.2s" }}
+      >
+        Tap to lift your cup
+      </div>
+    </button>
+  );
+}
+
+// A small static cup standing in for an opponent's hidden dice, with a
+// count badge instead of rendering a row of blank tiles.
+function MiniCup({ count, size = 30 }) {
+  return (
+    <div className="flex flex-col items-center">
+      <div
+        style={{
+          width: size,
+          height: size * 0.62,
+          background: "linear-gradient(180deg, #5a3a22, #2c1a0e)",
+          borderRadius: "4px 4px 14px 14px / 4px 4px 16px 16px",
+          border: "2px solid #7a5030",
+        }}
+      />
+      <div className="text-[#e8d4ae] text-[10px] mt-0.5">{count}</div>
+    </div>
+  );
+}
+
+const GlobalStyle = () => (
+  <style>{`
+    @import url('https://fonts.googleapis.com/css2?family=Rye&family=Arvo:wght@400;700&display=swap');
+    .rye { font-family: 'Rye', serif; }
+    .felt-texture { background-image: radial-gradient(rgba(0,0,0,0.15) 1px, transparent 1px); background-size: 6px 6px; }
+    .poster { background: #ecdcb0; background-image: linear-gradient(rgba(150,120,70,0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(150,120,70,0.08) 1px, transparent 1px); background-size: 14px 14px; }
+  `}</style>
+);
+
+function DeadMansDice() {
+  const [screen, setScreen] = useState("loading"); // loading | auth | lobby | playing
+  const [token, setToken] = useState(null);
+  const [authMode, setAuthMode] = useState("login");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+
+  const [wallet, setWallet] = useState(null);
+  const [checkinMsg, setCheckinMsg] = useState("");
+  const [watchingAd, setWatchingAd] = useState(false);
+
+  const [sessionId, setSessionId] = useState(null);
+  const [pot, setPot] = useState(0);
+  const [gameState, setGameState] = useState(null);
+  const [pendingReveal, setPendingReveal] = useState(null);
+  const [actionError, setActionError] = useState("");
+  const [actionBusy, setActionBusy] = useState(false);
+  const [bidQty, setBidQty] = useState(1);
+  const [bidFace, setBidFace] = useState(1);
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  const [peeked, setPeeked] = useState(false);
+  const revealTimeoutRef = useRef(null);
+
+  const fontStyle = { fontFamily: "'Arvo', serif" };
+
+  const loadWallet = useCallback(async (tok) => {
+    const data = await apiRequest("/wallet", { token: tok });
+    setWallet(data);
+    return data;
+  }, []);
+
+  const logout = useCallback(async () => {
+    setToken(null);
+    setWallet(null);
+    setScreen("auth");
+    try {
+      localStorage.removeItem("dmdToken");
+    } catch (e) {
+      // best-effort
+    }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const saved = localStorage.getItem("dmdSoundEnabled");
+        if (saved === "false") setSoundEnabled(false);
+      } catch (e) {
+        // default stays on
+      }
+    })();
+  }, []);
+
+  const toggleSound = async () => {
+    setSoundEnabled((prev) => {
+      const next = !prev;
+      try { localStorage.setItem("dmdSoundEnabled", String(next)); } catch (e) {}
+      return next;
+    });
+  };
+
+  // On mount: try to resume a saved session.
+  useEffect(() => {
+    (async () => {
+      let savedToken = null;
+      try {
+        savedToken = localStorage.getItem("dmdToken");
+      } catch (e) {
+        // storage unavailable
+      }
+      if (!savedToken) {
+        setScreen("auth");
+        return;
+      }
+      try {
+        setToken(savedToken);
+        await loadWallet(savedToken);
+        setScreen("lobby");
+      } catch (e) {
+        try {
+          localStorage.removeItem("dmdToken");
+        } catch (_) {}
+        setScreen("auth");
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleAuthSubmit = async () => {
+    setAuthError("");
+    if (!username.trim() || !password) {
+      setAuthError("enter a name and password");
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      const path = authMode === "login" ? "/auth/login" : "/auth/register";
+      const data = await apiRequest(path, { method: "POST", body: { username: username.trim(), password } });
+      setToken(data.token);
+      try {
+        localStorage.setItem("dmdToken", data.token);
+      } catch (e) {
+        // best-effort
+      }
+      await loadWallet(data.token);
+      setScreen("lobby");
+    } catch (e) {
+      setAuthError(e.message);
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleCheckIn = async () => {
+    setCheckinMsg("");
+    try {
+      const data = await apiRequest("/wallet/checkin", { method: "POST", token });
+      setWallet((w) => ({ ...w, coins: data.coins, streak: data.streak, checkedInToday: true }));
+      setCheckinMsg(`+${data.reward} coins — Day ${data.streak} streak!`);
+      sounds.coin(soundEnabled);
+    } catch (e) {
+      setCheckinMsg(e.message);
+    }
+  };
+
+  const handleWatchVideo = () => {
+    if (watchingAd) return;
+    setWatchingAd(true);
+    setTimeout(async () => {
+      try {
+        const data = await apiRequest("/wallet/watch-video", { method: "POST", token });
+        setWallet((w) => ({ ...w, coins: data.coins, videosWatchedToday: data.videosWatchedToday }));
+        sounds.coin(soundEnabled);
+      } catch (e) {
+        setCheckinMsg(e.message);
+      } finally {
+        setWatchingAd(false);
+      }
+    }, 2800);
+  };
+
+  const sitDown = async (ante) => {
+    setActionError("");
+    try {
+      const data = await apiRequest("/game/ante", { method: "POST", token, body: { ante } });
+      setSessionId(data.sessionId);
+      setPot(data.pot);
+      setWallet((w) => ({ ...w, coins: data.coins }));
+      setGameState(data.state);
+      setPendingReveal(null);
+      setPeeked(false);
+      setScreen("playing");
+    } catch (e) {
+      setCheckinMsg(e.message);
+    }
+  };
+
+  useEffect(() => {
+    const m = minimalNextBid(gameState?.currentBid);
+    setBidQty(m.qty);
+    setBidFace(m.face);
+  }, [gameState?.currentBid]);
+
+  const sendAction = async (payload) => {
+    if (actionBusy) return;
+    setActionError("");
+    setActionBusy(true);
+    if (payload.type === "bid") sounds.bidSlam(soundEnabled);
+    if (payload.type === "challenge") sounds.challengeSting(soundEnabled);
+    if (payload.type === "spotOn") sounds.spotOnSting(soundEnabled);
+    try {
+      const data = await apiRequest(`/game/${sessionId}/action`, { method: "POST", token, body: payload });
+      if (data.lastReveal) {
+        setPendingReveal(data.lastReveal);
+        sounds.reveal(soundEnabled);
+        revealTimeoutRef.current = setTimeout(() => {
+          setPendingReveal(null);
+          setGameState(data.state);
+          setWallet((w) => ({ ...w, coins: data.coins }));
+          setPeeked(false);
+          if (data.state.phase === "gameover") {
+            if (data.state.winnerId === "you") sounds.win(soundEnabled);
+            else sounds.lose(soundEnabled);
+          }
+          setActionBusy(false);
+        }, 2400);
+      } else {
+        setGameState(data.state);
+        setWallet((w) => ({ ...w, coins: data.coins }));
+        setActionBusy(false);
+      }
+    } catch (e) {
+      setActionError(e.message);
+      setActionBusy(false);
+    }
+  };
+
+  const backToLobby = async () => {
+    clearTimeout(revealTimeoutRef.current);
+    setScreen("lobby");
+    try {
+      await loadWallet(token);
+    } catch (e) {
+      // ignore, wallet already has last-known values
+    }
+  };
+
+  if (screen === "loading") {
+    return (
+      <div
+        className="min-h-screen w-full flex items-center justify-center"
+        style={{ background: "radial-gradient(ellipse at center, #2a1c10 0%, #150d07 70%, #0d0704 100%)", ...fontStyle }}
+      >
+        <GlobalStyle />
+        <div className="rye text-2xl text-[#d98f3b]">Shufflin' the deck...</div>
+      </div>
+    );
+  }
+
+  if (screen === "auth") {
+    return (
+      <div
+        className="min-h-screen w-full flex items-center justify-center p-4"
+        style={{ background: "radial-gradient(ellipse at center, #2a1c10 0%, #150d07 70%, #0d0704 100%)", ...fontStyle }}
+      >
+        <GlobalStyle />
+        <div className="w-full max-w-sm">
+          <div className="text-center mb-6">
+            <h1 className="rye text-4xl tracking-wide" style={{ color: "#d98f3b", textShadow: "0 2px 0 #000" }}>
+              Dead Man's Dice
+            </h1>
+            <p className="text-[#e8d4ae] text-sm tracking-widest uppercase mt-1">A Saloon Bluffing Table</p>
+          </div>
+          <div className="rounded-xl border-2 border-[#6b5430] p-4" style={{ background: "rgba(0,0,0,0.3)" }}>
+            <div className="flex mb-3 rounded-lg overflow-hidden border border-[#6b5430]">
+              <button
+                onClick={() => setAuthMode("login")}
+                className={`flex-1 py-2 text-sm rye ${authMode === "login" ? "bg-[#d98f3b] text-[#241812]" : "bg-transparent text-[#e8d4ae]"}`}
+              >
+                Log In
+              </button>
+              <button
+                onClick={() => setAuthMode("register")}
+                className={`flex-1 py-2 text-sm rye ${authMode === "register" ? "bg-[#d98f3b] text-[#241812]" : "bg-transparent text-[#e8d4ae]"}`}
+              >
+                New Rider
+              </button>
+            </div>
+            <input
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="Name"
+              className="w-full mb-2 px-3 py-2 rounded bg-black/50 text-[#ecdcb0] border border-[#8a6b3f] placeholder-[#a1855a] outline-none"
+            />
+            <input
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              type="password"
+              placeholder="Password"
+              className="w-full mb-3 px-3 py-2 rounded bg-black/50 text-[#ecdcb0] border border-[#8a6b3f] placeholder-[#a1855a] outline-none"
+            />
+            {authError && <div className="text-[#ff9d9d] font-bold text-xs mb-2">{authError}</div>}
+            <button
+              onClick={handleAuthSubmit}
+              disabled={authBusy}
+              className="w-full rye py-2 rounded-lg bg-[#6b1f1f] text-[#ecdcb0] border-2 border-[#8a2e2e] disabled:opacity-55 hover:bg-[#7d2424] transition-colors"
+            >
+              {authBusy ? "..." : authMode === "login" ? "Sit Down" : "Create Account"}
+            </button>
+          </div>
+          {API_BASE.includes("YOUR-BACKEND-URL") && (
+            <div className="text-[#9c3b3b] text-xs mt-3 text-center">
+              Set API_BASE at the top of this file to your deployed backend URL first.
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === "lobby") {
+    const todayVideosWatched = wallet?.videosWatchedToday ?? 0;
+    const alreadyCheckedIn = wallet?.checkedInToday ?? false;
+    return (
+      <div
+        className="min-h-screen w-full flex items-center justify-center p-4"
+        style={{ background: "radial-gradient(ellipse at center, #2a1c10 0%, #150d07 70%, #0d0704 100%)", ...fontStyle }}
+      >
+        <GlobalStyle />
+        <div className="w-full max-w-md">
+          <div className="flex items-center justify-between mb-2">
+            <button onClick={toggleSound} className="text-[#e8d4ae] hover:text-[#d98f3b]">
+              {soundEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
+            </button>
+            <button onClick={logout} className="text-[#e8d4ae] text-xs uppercase tracking-widest hover:text-[#d98f3b] flex items-center gap-1">
+              <LogOut size={12} /> Log Out
+            </button>
+          </div>
+          <div className="text-center mb-4">
+            <h1 className="rye text-4xl sm:text-5xl tracking-wide" style={{ color: "#d98f3b", textShadow: "0 2px 0 #000, 0 0 20px rgba(217,143,59,0.3)" }}>
+              Dead Man's Dice
+            </h1>
+            <p className="text-[#e8d4ae] text-sm tracking-widest uppercase mt-1">A Saloon Bluffing Table</p>
+          </div>
+
+          <div className="rounded-xl border-2 border-[#8a6b2f] p-4 mb-4 flex items-center justify-between" style={{ background: "rgba(0,0,0,0.35)" }}>
+            <div className="flex items-center gap-2">
+              <Coins size={26} className="text-[#d98f3b]" />
+              <span className="rye text-2xl text-[#ecdcb0]">{wallet?.coins ?? "..."}</span>
+              <span className="text-[#e8d4ae] text-xs uppercase">coins</span>
+            </div>
+          </div>
+
+          <div className="rounded-xl border-2 border-[#6b5430] p-3 mb-3" style={{ background: "rgba(0,0,0,0.25)" }}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[#ecdcb0] text-sm font-bold flex items-center gap-1">
+                <CalendarCheck size={16} /> Daily Check-In
+              </span>
+              <span className="text-[#e8d4ae] text-xs">Day {wallet?.streak || 0}/7</span>
+            </div>
+            <div className="flex gap-1 mb-2">
+              {CHECKIN_REWARDS.map((r, i) => (
+                <div
+                  key={i}
+                  className={`flex-1 text-center rounded py-1 text-[10px] ${
+                    i < (wallet?.streak || 0) ? "bg-[#d98f3b] text-[#241812]" : "bg-black/30 text-[#b5966a]"
+                  }`}
+                >
+                  {r}
+                </div>
+              ))}
+            </div>
+            <button
+              disabled={alreadyCheckedIn}
+              onClick={handleCheckIn}
+              className="w-full rye py-2 rounded-lg bg-[#6b1f1f] text-[#ecdcb0] border-2 border-[#8a2e2e] disabled:opacity-50 hover:bg-[#7d2424] transition-colors"
+            >
+              {alreadyCheckedIn ? "Come back tomorrow" : "Claim Today's Coins"}
+            </button>
+            {checkinMsg && <div className="text-center text-[#d98f3b] text-xs mt-1">{checkinMsg}</div>}
+          </div>
+
+          <div className="rounded-xl border-2 border-[#6b5430] p-3 mb-4" style={{ background: "rgba(0,0,0,0.25)" }}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[#ecdcb0] text-sm font-bold flex items-center gap-1">
+                <Play size={16} /> Watch a Video
+              </span>
+              <span className="text-[#e8d4ae] text-xs">{todayVideosWatched}/{wallet?.maxVideosPerDay ?? 5} today</span>
+            </div>
+            <button
+              disabled={todayVideosWatched >= (wallet?.maxVideosPerDay ?? 5) || watchingAd}
+              onClick={handleWatchVideo}
+              className="w-full rye py-2 rounded-lg bg-[#3b2415] text-[#ecdcb0] border-2 border-[#6b5430] disabled:opacity-50 hover:bg-[#4a2e1a] transition-colors"
+            >
+              {watchingAd ? "Playing..." : todayVideosWatched >= (wallet?.maxVideosPerDay ?? 5) ? "Come back tomorrow" : "Watch for +100 coins"}
+            </button>
+            <div className="text-[#b5966a] text-[10px] mt-1 text-center italic">simulated ad — swap in a real ad SDK's server callback later</div>
+          </div>
+
+          <div className="text-[#e8d4ae] text-xs uppercase tracking-widest mb-2 text-center">Choose Your Table</div>
+          <div className="grid grid-cols-3 gap-2">
+            {TABLES.map((t) => (
+              <button
+                key={t.label}
+                disabled={(wallet?.coins ?? 0) < t.amount}
+                onClick={() => sitDown(t.amount)}
+                className="poster rounded-lg p-3 text-center border-2 border-[#8a6b2f] disabled:opacity-50 hover:-translate-y-0.5 transition-transform"
+              >
+                <div className="text-[#241812] text-[10px] uppercase">{t.label}</div>
+                <div className="rye text-xl text-[#241812]">{t.amount}</div>
+                <div className="text-[#5a4020] text-[9px]">ante</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- playing screen ----
+  if (!gameState) return null;
+  const you = gameState.players.find((p) => p.id === "you");
+  const opponents = gameState.players.filter((p) => p.id !== "you");
+  const totalDice = gameState.players.reduce((s, p) => (p.alive ? s + (p.dice ? p.dice.length : p.diceCount) : s), 0);
+  const isPlayerTurn = gameState.phase === "bidding" && gameState.whoseTurn === "you" && !pendingReveal;
+  const revealFace = pendingReveal?.bid?.face;
+  const reactionFor = (playerId) => {
+    if (!pendingReveal) return "neutral";
+    if (playerId === pendingReveal.loserId) return "caught";
+    if (playerId === pendingReveal.bid.playerId) return "smug";
+    return "neutral";
+  };
+
+  return (
+    <div
+      className="min-h-screen w-full flex items-center justify-center p-4"
+      style={{ background: "radial-gradient(ellipse at center, #2a1c10 0%, #150d07 70%, #0d0704 100%)", ...fontStyle }}
+    >
+      <GlobalStyle />
+      <div className="w-full max-w-3xl">
+        <div className="flex items-center justify-between mb-3">
+          <button onClick={backToLobby} className="text-[#e8d4ae] text-xs uppercase tracking-widest hover:text-[#d98f3b]">
+            &larr; Lobby
+          </button>
+          <div className="flex items-center gap-3">
+            <button onClick={toggleSound} className="text-[#e8d4ae] hover:text-[#d98f3b]">
+              {soundEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
+            </button>
+            <div className="flex items-center gap-2 text-[#d98f3b]">
+              <Coins size={16} /> <span className="rye">{wallet?.coins ?? "..."}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="text-center mb-4">
+          <h1 className="rye text-3xl sm:text-4xl tracking-wide" style={{ color: "#d98f3b", textShadow: "0 2px 0 #000, 0 0 20px rgba(217,143,59,0.3)" }}>
+            Dead Man's Dice
+          </h1>
+        </div>
+
+        <div className="rounded-2xl border-4 felt-texture p-4 sm:p-6" style={{ background: "linear-gradient(160deg, #5a1f1f, #3d1414)", borderColor: "#3b2415" }}>
+          <div className="grid grid-cols-3 gap-2 sm:gap-4 mb-4">
+            {opponents.map((p) => {
+              const isTurn = gameState.phase === "bidding" && gameState.whoseTurn === p.id;
+              const revealed = pendingReveal?.revealedPlayers?.find((rp) => rp.id === p.id);
+              const diceCount = p.diceCount ?? p.dice?.length ?? 0;
+              const diceToShow = revealed ? revealed.dice : Array(diceCount).fill(0);
+              return (
+                <div
+                  key={p.id}
+                  className={`rounded-xl p-2 sm:p-3 text-center border-2 transition-all ${p.alive ? "opacity-100" : "opacity-40 grayscale"}`}
+                  style={{
+                    background: "rgba(0,0,0,0.25)",
+                    borderColor: isTurn ? "#d98f3b" : "rgba(200,170,120,0.25)",
+                    boxShadow: isTurn ? "0 0 14px rgba(217,143,59,0.5)" : "none",
+                  }}
+                >
+                  <div
+                    className="mx-auto mb-1 rounded-full flex items-center justify-center overflow-hidden"
+                    style={{ width: 52, height: 52, background: "rgba(236,220,176,0.15)", border: `2px solid ${p.color}` }}
+                  >
+                    <NpcPortrait id={p.id} size={48} reaction={reactionFor(p.id)} />
+                  </div>
+                  <div className="text-[#ecdcb0] text-xs sm:text-sm font-bold leading-tight">{p.name}</div>
+                  <div className="text-[#e8d4ae] text-[10px] sm:text-xs italic mb-1">{p.title}</div>
+                  <div className="flex justify-center gap-1 flex-wrap">
+                    {revealed ? (
+                      diceToShow.map((d, i) => <DiceFace key={i} value={d} highlight={d === revealFace} size={22} />)
+                    ) : (
+                      <MiniCup count={diceCount} size={30} />
+                    )}
+                  </div>
+                  {!p.alive && <div className="text-[#9c3b3b] text-[10px] mt-1">OUT</div>}
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex justify-center items-center gap-4 mb-4 flex-wrap">
+            <div className="poster rounded-md px-6 py-3 shadow-lg -rotate-1 border-2 border-[#8a6b2f] relative">
+              <div className="text-center text-[#241812]">
+                <div className="text-[10px] uppercase tracking-widest">Current Bid</div>
+                {gameState.currentBid ? (
+                  <div className="rye text-3xl">
+                    {gameState.currentBid.qty} &times; {gameState.currentBid.face}'s
+                  </div>
+                ) : (
+                  <div className="rye text-2xl">No bid yet</div>
+                )}
+                {gameState.currentBid && (
+                  <div className="text-xs italic mt-1">
+                    called by {gameState.players.find((p) => p.id === gameState.currentBid.playerId)?.name}
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="rounded-md px-4 py-2 border-2 border-[#d98f3b] flex items-center gap-2" style={{ background: "rgba(0,0,0,0.35)" }}>
+              <Coins size={18} className="text-[#d98f3b]" />
+              <span className="rye text-xl text-[#ecdcb0]">{pot}</span>
+              <span className="text-[#e8d4ae] text-[10px] uppercase">pot</span>
+            </div>
+          </div>
+
+          <div className="rounded-lg bg-black/30 p-2 mb-4 max-h-24 overflow-y-auto">
+            {gameState.log.map((l, i) => (
+              <div key={i} className="text-[#d8c290] text-xs leading-relaxed" style={{ opacity: 1 - i * 0.1 }}>
+                {l}
+              </div>
+            ))}
+          </div>
+
+          {actionError && <div className="text-center text-[#ff9d9d] font-bold text-xs mb-2">{actionError}</div>}
+
+          <div className="rounded-xl p-3 sm:p-4 border-2" style={{ background: "rgba(0,0,0,0.25)", borderColor: isPlayerTurn ? "#d98f3b" : "rgba(200,170,120,0.25)" }}>
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-[#ecdcb0] font-bold text-sm sm:text-base flex items-center gap-2">
+                <div
+                  className="rounded-full flex items-center justify-center overflow-hidden"
+                  style={{ width: 34, height: 34, background: "rgba(236,220,176,0.15)", border: "2px solid #b89a6c" }}
+                >
+                  <StrangerPortrait size={30} />
+                </div>
+                You {!you.alive && <span className="text-[#9c3b3b]">(OUT)</span>}
+              </div>
+              {peeked ? (
+                <div className="flex gap-1">
+                  {(you.dice || []).map((d, i) => (
+                    <DiceFace key={i} value={d} size={30} highlight={gameState.currentBid && d === gameState.currentBid.face} />
+                  ))}
+                </div>
+              ) : (
+                <div className="text-[#b5966a] text-xs italic flex items-center gap-1">
+                  <Hand size={12} /> cup down
+                </div>
+              )}
+            </div>
+            {!peeked && you.alive && gameState.phase !== "gameover" && (
+              <LiftCup
+                onLift={() => {
+                  sounds.cupLift(soundEnabled);
+                  setPeeked(true);
+                }}
+              />
+            )}
+
+            {gameState.phase === "gameover" ? (
+              <div className="text-center py-3">
+                <div className="rye text-2xl text-[#d98f3b] mb-2">
+                  {gameState.winnerId === "you" ? `You win the pot — ${pot} coins!` : `${gameState.players.find((p) => p.id === gameState.winnerId)?.name} takes the ${pot}-coin pot.`}
+                </div>
+                <button onClick={backToLobby} className="rye inline-flex items-center gap-2 px-5 py-2 rounded-lg bg-[#d98f3b] text-[#241812] hover:bg-[#e8a555] transition-colors">
+                  <RotateCcw size={18} /> Back to Lobby
+                </button>
+              </div>
+            ) : isPlayerTurn && !peeked ? (
+              <div className="text-center text-[#d98f3b] text-sm italic py-3">Lift your cup to see your dice before you play.</div>
+            ) : isPlayerTurn ? (
+              <div className="flex flex-col sm:flex-row gap-3 items-center justify-center mt-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-[#e8d4ae] text-xs uppercase">Qty</span>
+                  <button className="w-7 h-7 rounded bg-[#3b2415] text-[#ecdcb0] flex items-center justify-center" onClick={() => setBidQty((q) => Math.max(1, q - 1))}>
+                    <Minus size={14} />
+                  </button>
+                  <span className="rye text-xl text-[#ecdcb0] w-6 text-center">{bidQty}</span>
+                  <button className="w-7 h-7 rounded bg-[#3b2415] text-[#ecdcb0] flex items-center justify-center" onClick={() => setBidQty((q) => Math.min(totalDice, q + 1))}>
+                    <Plus size={14} />
+                  </button>
+                </div>
+                <div className="flex items-center gap-1">
+                  {FACES.map((f) => (
+                    <button
+                      key={f}
+                      onClick={() => setBidFace(f)}
+                      className={`w-8 h-8 rounded border-2 rye text-sm ${bidFace === f ? "bg-[#d98f3b] text-[#241812] border-[#d98f3b]" : "bg-transparent text-[#ecdcb0] border-[#6b5430]"}`}
+                    >
+                      {f}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  disabled={!isValidBid({ qty: bidQty, face: bidFace }, gameState.currentBid) || actionBusy}
+                  onClick={() => sendAction({ type: "bid", qty: bidQty, face: bidFace })}
+                  className="rye px-4 py-2 rounded-lg bg-[#6b1f1f] text-[#ecdcb0] border-2 border-[#8a2e2e] disabled:opacity-50 hover:bg-[#7d2424] transition-colors"
+                >
+                  Place Bid
+                </button>
+                {gameState.currentBid && (
+                  <>
+                    <button
+                      disabled={actionBusy}
+                      onClick={() => sendAction({ type: "challenge" })}
+                      className="rye px-4 py-2 rounded-lg bg-[#241812] text-[#d98f3b] border-2 border-[#d98f3b] flex items-center gap-2 hover:bg-[#3a2a1a] transition-colors disabled:opacity-50"
+                    >
+                      <Crosshair size={16} /> Call Liar!
+                    </button>
+                    <button
+                      disabled={actionBusy}
+                      onClick={() => sendAction({ type: "spotOn" })}
+                      className="rye px-4 py-2 rounded-lg bg-[#1e2f1e] text-[#8fd98f] border-2 border-[#4a7d4a] flex items-center gap-2 hover:bg-[#274027] transition-colors disabled:opacity-50"
+                    >
+                      <Target size={16} /> Spot On!
+                    </button>
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className="text-center text-[#e8d4ae] text-sm italic py-3">
+                {pendingReveal ? "Cups are up..." : `Waitin' on ${gameState.players.find((p) => p.id === gameState.whoseTurn)?.name}...`}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="text-center mt-3 text-[#b5966a] text-xs flex items-center justify-center gap-1">
+          <Skull size={12} /> {totalDice} dice still on the table
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<DeadMansDice />);
+</script>
+</body>
+</html>
